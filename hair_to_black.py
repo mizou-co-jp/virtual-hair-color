@@ -37,10 +37,15 @@ CAM_HEIGHT = 720
 CAM_FPS = 30
 
 # 髪を黒くする設定
-# HSVで彩度を下げ、明度を下げることで黒髪にする
-TARGET_SATURATION = 30   # 低彩度（0-255）
-TARGET_VALUE = 40        # 低明度（0-255）で黒に近づける
-BLEND_ALPHA = 0.85       # ブレンド強度（0.0-1.0）
+DARKENING_FACTOR = 0.35  # 明度をどれだけ暗くするか（小さいほど暗い）
+DESAT_FACTOR = 0.15      # 彩度をどれだけ残すか（小さいほど無彩色）
+BLEND_ALPHA = 0.90       # ブレンド強度（0.0-1.0）
+
+# マスク精製設定
+GUIDED_FILTER_RADIUS = 8     # ガイドフィルタ半径（大きいほど滑らか）
+GUIDED_FILTER_EPS = 0.01     # ガイドフィルタ正則化（小さいほどエッジに忠実）
+MORPH_ERODE_SIZE = 3         # 収縮カーネルサイズ（マスク内側のノイズ除去）
+REFINE_ITERATIONS = 3        # マスク精製の反復回数
 
 
 def create_segmenter():
@@ -53,26 +58,107 @@ def create_segmenter():
     return ImageSegmenter.create_from_options(options)
 
 
-def make_hair_black(frame_bgr, hair_mask, alpha):
-    """髪領域を黒色に変換"""
-    mask_bool = hair_mask > 0
+def guided_filter(guide, src, radius, eps):
+    """エッジ保持ガイドフィルタ（生え際を画像のエッジに沿わせる）"""
+    guide_f = guide.astype(np.float32) / 255.0
+    src_f = src.astype(np.float32)
 
-    if not np.any(mask_bool):
+    ksize = (2 * radius + 1, 2 * radius + 1)
+
+    mean_g = cv2.blur(guide_f, ksize)
+    mean_s = cv2.blur(src_f, ksize)
+    mean_gs = cv2.blur(guide_f * src_f, ksize)
+    mean_gg = cv2.blur(guide_f * guide_f, ksize)
+
+    cov_gs = mean_gs - mean_g * mean_s
+    var_g = mean_gg - mean_g * mean_g
+
+    a = cov_gs / (var_g + eps)
+    b = mean_s - a * mean_g
+
+    mean_a = cv2.blur(a, ksize)
+    mean_b = cv2.blur(b, ksize)
+
+    return mean_a * guide_f + mean_b
+
+
+def refine_hair_mask(frame_bgr, raw_mask):
+    """生え際を精密にするマスク精製パイプライン"""
+    h, w = raw_mask.shape[:2]
+
+    # 1. マスクをフレーム解像度にリサイズ（バイキュービック補間で高品質に）
+    if raw_mask.shape[:2] != frame_bgr.shape[:2]:
+        mask = cv2.resize(
+            raw_mask, (w, h), interpolation=cv2.INTER_CUBIC
+        ).astype(np.float32)
+    else:
+        mask = raw_mask.astype(np.float32)
+
+    # 正規化
+    if mask.max() > 1.0:
+        mask = mask / 255.0
+
+    # 2. モルフォロジー処理：小さなノイズ除去 + マスク境界の安定化
+    mask_u8 = (mask * 255).astype(np.uint8)
+
+    # 小さな穴を埋める（close）
+    kernel_close = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (5, 5)
+    )
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel_close)
+
+    # 小さなノイズを除去（open）
+    kernel_open = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (MORPH_ERODE_SIZE, MORPH_ERODE_SIZE)
+    )
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel_open)
+
+    # 3. ガイドフィルタを複数回適用（画像のエッジに沿ってマスクを整列）
+    #    グレースケール画像をガイドにすることで、髪と肌の境界に忠実なマスクになる
+    guide_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    refined = mask_u8.astype(np.float32) / 255.0
+
+    for _ in range(REFINE_ITERATIONS):
+        refined = guided_filter(guide_gray, refined, GUIDED_FILTER_RADIUS, GUIDED_FILTER_EPS)
+
+    # 4. エッジ付近でさらに精密なトリミング
+    #    Cannyエッジ検出で画像の輪郭を取得し、マスク境界をエッジに吸着
+    edges = cv2.Canny(guide_gray, 50, 150)
+    edge_dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    edge_band = edge_dilated.astype(np.float32) / 255.0
+
+    # エッジ帯域ではマスクをよりシャープに（ガイドフィルタの結果を優先）
+    # エッジ外ではよりスムーズに
+    smooth = cv2.GaussianBlur(refined, (3, 3), 1)
+    refined = refined * edge_band + smooth * (1 - edge_band)
+
+    # 5. 値域をクリップして最終マスク
+    refined = np.clip(refined, 0.0, 1.0)
+
+    return refined
+
+
+def make_hair_black(frame_bgr, hair_mask, alpha):
+    """髪領域を自然な黒髪に変換（精密マスク + テクスチャ保持）"""
+    if not np.any(hair_mask > 0):
         return frame_bgr
 
-    # マスクをぼかしてエッジを滑らかにする
-    mask_float = hair_mask.astype(np.float32) / 255.0
-    mask_float = cv2.GaussianBlur(mask_float, (15, 15), 5)
-    mask_3ch = np.stack([mask_float] * 3, axis=-1)
+    # 精密マスク精製
+    mask_refined = refine_hair_mask(frame_bgr, hair_mask)
+    mask_3ch = np.stack([mask_refined] * 3, axis=-1)
 
-    # HSVに変換して彩度と明度を操作
+    # HSVに変換：元のテクスチャ（明暗の濃淡）を保持しつつ暗くする
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
 
     black_hsv = hsv.copy()
-    black_hsv[:, :, 1] = TARGET_SATURATION  # 低彩度
-    black_hsv[:, :, 2] = np.minimum(hsv[:, :, 2], TARGET_VALUE)  # 明度を下げる
+    # 彩度を大幅に落とす（でもゼロにはしない→微妙な色味が残りリアル）
+    black_hsv[:, :, 1] = hsv[:, :, 1] * DESAT_FACTOR
+    # 明度を比率で下げる→元の明暗差（ツヤ、影）がそのまま残る
+    black_hsv[:, :, 2] = hsv[:, :, 2] * DARKENING_FACTOR
 
-    black_bgr = cv2.cvtColor(black_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    black_bgr = cv2.cvtColor(
+        np.clip(black_hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
+    )
 
     # マスク領域のみブレンド
     blended = (
