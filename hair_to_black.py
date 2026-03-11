@@ -39,13 +39,16 @@ CAM_FPS = 30
 # 髪を黒くする設定
 DARKENING_FACTOR = 0.35  # 明度をどれだけ暗くするか（小さいほど暗い）
 DESAT_FACTOR = 0.15      # 彩度をどれだけ残すか（小さいほど無彩色）
-BLEND_ALPHA = 0.90       # ブレンド強度（0.0-1.0）
+BLEND_ALPHA = 0.95       # ブレンド強度（0.0-1.0）
 
 # マスク精製設定
 GUIDED_FILTER_RADIUS = 8     # ガイドフィルタ半径（大きいほど滑らか）
 GUIDED_FILTER_EPS = 0.01     # ガイドフィルタ正則化（小さいほどエッジに忠実）
 MORPH_ERODE_SIZE = 3         # 収縮カーネルサイズ（マスク内側のノイズ除去）
+MORPH_DILATE_SIZE = 7        # 膨張カーネルサイズ（マスクを広げて取りこぼし防止）
 REFINE_ITERATIONS = 3        # マスク精製の反復回数
+MASK_THRESHOLD = 0.1         # マスク閾値（低いほど広く検出、0.0-1.0）
+TEMPORAL_SMOOTH = 0.6        # 時間平滑化（前フレームのマスクをどれだけ混ぜるか）
 
 
 def create_segmenter():
@@ -98,12 +101,20 @@ def refine_hair_mask(frame_bgr, raw_mask):
     if mask.max() > 1.0:
         mask = mask / 255.0
 
-    # 2. モルフォロジー処理：小さなノイズ除去 + マスク境界の安定化
+    # 2. 低い閾値で二値化（取りこぼしを減らす）
+    mask = np.where(mask > MASK_THRESHOLD, mask, 0.0)
+
     mask_u8 = (mask * 255).astype(np.uint8)
+
+    # 膨張で髪領域を広げる（生え際の取りこぼし防止）
+    kernel_dilate = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (MORPH_DILATE_SIZE, MORPH_DILATE_SIZE)
+    )
+    mask_u8 = cv2.dilate(mask_u8, kernel_dilate, iterations=1)
 
     # 小さな穴を埋める（close）
     kernel_close = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (5, 5)
+        cv2.MORPH_ELLIPSE, (7, 7)
     )
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel_close)
 
@@ -210,6 +221,7 @@ def main():
     alpha = BLEND_ALPHA
     frame_count = 0
     start_time = time.time()
+    prev_mask = None  # 前フレームのマスク（時間平滑化用）
 
     print("\n--- 操作方法 ---")
     print("q: 終了")
@@ -242,8 +254,20 @@ def main():
 
                 if result.category_mask is not None:
                     hair_mask = result.category_mask.numpy_view()
-                    # マスクを0-255にスケール
-                    hair_mask_scaled = (hair_mask * 255).astype(np.uint8)
+                    hair_mask_f = hair_mask.astype(np.float32)
+
+                    # 時間平滑化：前フレームのマスクと混合してちらつき防止
+                    if prev_mask is not None and prev_mask.shape == hair_mask_f.shape:
+                        hair_mask_f = (
+                            TEMPORAL_SMOOTH * prev_mask
+                            + (1 - TEMPORAL_SMOOTH) * hair_mask_f
+                        )
+                        # 前フレームで検出されていた領域は簡単に消えないようにする
+                        hair_mask_f = np.maximum(hair_mask_f, prev_mask * 0.5)
+                    prev_mask = hair_mask_f.copy()
+
+                    # 0-255にスケール
+                    hair_mask_scaled = (hair_mask_f * 255).astype(np.uint8)
                     output = make_hair_black(frame, hair_mask_scaled, alpha)
 
             # 仮想カメラに送信
